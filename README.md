@@ -7,6 +7,7 @@ A [KOReader](https://koreader.rocks/) plugin that syncs your **reading stats and
 - One-tap OPDS browse of your Loomera/Calibre library (auto-registered into KOReader's catalog list)
 - Opportunistic auto-sync on book close + a 5-minute timer (never forces Wi-Fi)
 - Both POSTs are `Authorization: Bearer <SYNC_TOKEN>` guarded
+- **Check for updates** — compares your installed version against this repo and tells you when a newer plugin is available
 
 Works with the [Loomera Obsidian plugin](https://github.com/apartri/Loomera-Obsidian), which turns the highlights you push here into Markdown notes.
 
@@ -21,6 +22,15 @@ Open the Loomera setup wizard → **Books & e-reader** → **Download Loomera pl
    - Kindle/PocketBook/etc.: `koreader/plugins/`
 2. Edit `loomera.koplugin/loomera_config.lua` and set your `server_url` and `sync_token` — **or** leave them blank and fill them in on-device via **Menu → Loomera → Settings / About**.
 3. Restart KOReader. Use **Tools → Loomera → Sync**.
+
+## Menu
+
+Under **Tools → Loomera**:
+
+- **Sync** — full reconcile (reading stats + all highlight sidecars), idempotent.
+- **Browse my library** — open your Loomera/Calibre OPDS catalog.
+- **Check for updates** — fetch the latest version from this repo and report whether a newer plugin is available. To update, re-download from your server's **Books & e-reader** setup page (keeps your URL + token), or pull the new `loomera.koplugin/` from here.
+- **Settings / About** — shows the plugin version + server, and lets you edit the URL / token on-device.
 
 ## Config
 

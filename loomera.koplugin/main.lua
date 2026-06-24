@@ -29,14 +29,19 @@ local logger = require("logger")
 local _ = require("gettext")
 local T = require("ffi/util").template
 
+-- Public plugin repo. "Check for updates" reads the version from this repo's
+-- _meta.lua (raw) and compares it to this install's _meta.lua version. The raw
+-- file is fetched as plain text and pattern-matched — never executed.
+local REPO_URL = "https://github.com/apartri/Loomera-Koreader"
+local UPDATE_META_URL =
+    "https://raw.githubusercontent.com/apartri/Loomera-Koreader/main/loomera.koplugin/_meta.lua"
+
 local Loomera = WidgetContainer:extend{
     name = "loomera",
-    -- Minimum gap (seconds) between auto-sync pushes, to debounce rapid
+    -- Minimum gap (seconds) between sync-on-sleep pushes, to debounce rapid
     -- suspend/close cycles from hammering the server.
     AUTOSYNC_DEBOUNCE = 60,
-    -- Interval (seconds) of the opportunistic 5-minute auto-sync task.
-    PERIODIC_INTERVAL = 300,
-    -- Short timeout (seconds) for the reachability probe so the periodic task
+    -- Short timeout (seconds) for the reachability probe so the sleep-sync
     -- never blocks the UI when the server is down / out of range.
     PROBE_TIMEOUT = 4,
 }
@@ -77,21 +82,14 @@ function Loomera:init()
     self.sync_token = (cfg.sync_token or ""):gsub("%s+", "")
     self.from_wizard = (self.server_url ~= "" and self.sync_token ~= "")
 
-    -- 2) on-device fallback + persisted options (auto-sync toggle, and any
-    --    URL/token the user typed in the on-device Settings dialog).
+    -- 2) on-device fallback (any URL/token the user typed in the on-device
+    --    Settings dialog when the wizard didn't bake them in).
     self.store = LuaSettings:open(settings_path())
     if not self.from_wizard then
         self.server_url = (self.store:readSetting("server_url") or self.server_url or ""):gsub("%s+", "")
         self.sync_token = (self.store:readSetting("sync_token") or self.sync_token or ""):gsub("%s+", "")
     end
-    -- Default auto-sync ON: only treat it as disabled if the user explicitly
-    -- turned it off (persisted false). Read the raw value so an unset key (nil)
-    -- defaults to true — an opt-OUT default. (Avoid relying on LuaSettings
-    -- :nilOrTrue existing on every build.)
-    local stored_auto = self.store:readSetting("auto_sync")
-    self.auto_sync = (stored_auto == nil) or (stored_auto == true)
     self._last_autosync = 0
-    self._periodic_armed = false
 
     if self.ui and self.ui.menu then
         self.ui.menu:registerToMainMenu(self)
@@ -102,11 +100,6 @@ function Loomera:init()
     -- appears in Search -> OPDS catalog with no manual add. Guarded so a failure
     -- here can never block plugin init.
     pcall(function() self:registerCatalog() end)
-
-    -- Kick off the opportunistic 5-minute periodic task when enabled.
-    if self.auto_sync then
-        self:_startPeriodic()
-    end
 end
 
 function Loomera:isConfigured()
@@ -578,11 +571,21 @@ function Loomera:registerCatalog()
     return ok
 end
 
--- "Browse my library" — seamless. Ensure the catalog is registered, then land
--- the user on KOReader's native OPDS catalog list (where "Loomera Library" now
--- shows). Every step is pcall-guarded; we stop at the first that succeeds and
--- only fall through to the InfoMessage if no programmatic open works.
+-- "Browse my library" — opens the plugin's OWN OPDS browser (loomera_opds),
+-- which fetches + displays the Life Calendar catalog itself rather than relying
+-- on KOReader's native OPDS plugin. The native-catalog open is kept ONLY as a
+-- last-resort fallback for any build where the bundled browser fails to load.
 function Loomera:openOPDS()
+    if self.server_url == "" then return self:promptConfigure() end
+    local ok = pcall(function()
+        require("loomera_opds").browse(self)
+    end)
+    if not ok then self:openOPDSNative() end
+end
+
+-- Fallback only: register our feed into KOReader's native OPDS browser list and
+-- open it (the pre-bundled-browser behaviour). Every step is pcall-guarded.
+function Loomera:openOPDSNative()
     if self.server_url == "" then return self:promptConfigure() end
     local url = self:baseUrl() .. "/opds"
 
@@ -705,6 +708,74 @@ function Loomera:showSettingsDialog()
 end
 
 ------------------------------------------------------------------------------
+-- Update check (against the public repo)
+------------------------------------------------------------------------------
+
+-- Pull a `version = "x.y.z"` field out of a _meta.lua source string. A plain
+-- pattern match (NOT loadstring), so remote text is never executed. nil if absent.
+local function parse_meta_version(src)
+    if type(src) ~= "string" then return nil end
+    return src:match('version%s*=%s*["\']([%w%.%-]+)["\']')
+end
+
+-- True if dotted-numeric version `a` is strictly newer than `b`
+-- (e.g. "1.2.0" > "1.1.9"). Non-numeric parts count as 0, so a weird value
+-- degrades to "not newer" rather than throwing.
+local function version_gt(a, b)
+    local function parts(v)
+        local t = {}
+        for n in tostring(v or ""):gmatch("%d+") do t[#t + 1] = tonumber(n) end
+        return t
+    end
+    local pa, pb = parts(a), parts(b)
+    for i = 1, math.max(#pa, #pb) do
+        local x, y = pa[i] or 0, pb[i] or 0
+        if x ~= y then return x > y end
+    end
+    return false
+end
+
+-- This install's version, read from the plugin's own _meta.lua (the single
+-- source of truth — sibling require, same as loomera_config). "?" if unreadable.
+function Loomera:localVersion()
+    local ok, meta = pcall(require, "_meta")
+    if ok and type(meta) == "table" and meta.version then
+        return tostring(meta.version)
+    end
+    return "?"
+end
+
+-- Menu entry: "Check for updates". User-initiated, so OK to bring Wi-Fi up.
+-- Compares this install's version to the public repo's _meta.lua and shows
+-- exactly one InfoMessage (available / up-to-date / error). Never crashes.
+function Loomera:checkForUpdates()
+    local function run()
+        local ok, code, body = Loomera.httpGet(UPDATE_META_URL, 10)
+        if not ok or code ~= 200 then
+            self:notify(T(_("Loomera: couldn't check for updates\n%1"), tostring(code)), 5)
+            return
+        end
+        local remote = parse_meta_version(body)
+        local localv = self:localVersion()
+        if not remote then
+            self:notify(_("Loomera: couldn't read the latest version"), 5)
+            return
+        end
+        if version_gt(remote, localv) then
+            self:notify(T(_("Loomera: update available — v%1 (you have v%2).\n" ..
+                "Get it at %3 — or re-download from your server's Setup page\n" ..
+                "(Books & e-reader) to keep your URL + token."),
+                remote, localv, REPO_URL), 12)
+        else
+            self:notify(T(_("Loomera: up to date (v%1)."), localv), 4)
+        end
+    end
+    if not pcall(function() NetworkMgr:goOnlineToRun(run) end) then
+        self:notify(_("Loomera: could not connect to Wi-Fi"), 5)
+    end
+end
+
+------------------------------------------------------------------------------
 -- Main menu registration
 ------------------------------------------------------------------------------
 
@@ -721,19 +792,9 @@ function Loomera:addToMainMenu(menu_items)
                 callback = function() self:openOPDS() end,
             },
             {
-                text = _("Auto-sync every 5 min"),
-                checked_func = function() return self.auto_sync end,
-                callback = function()
-                    self.auto_sync = not self.auto_sync
-                    self.store:saveSetting("auto_sync", self.auto_sync)
-                    self.store:flush()
-                    -- Start/stop the opportunistic periodic task to match.
-                    if self.auto_sync then
-                        self:_startPeriodic()
-                    else
-                        self:_stopPeriodic()
-                    end
-                end,
+                text = _("Check for updates"),
+                keep_menu_open = true,
+                callback = function() self:checkForUpdates() end,
             },
             {
                 text = _("Settings / About"),
@@ -747,6 +808,7 @@ function Loomera:addToMainMenu(menu_items)
                         _("Loomera replaces Syncthing by pushing your reading"),
                         _("stats + highlights to your own server."),
                         "",
+                        T(_("Version: %1"), self:localVersion()),
                         T(_("Server: %1"), server),
                         T(_("Config source: %1"), where),
                         T(_("Token: %1"), self.sync_token ~= "" and _("set") or _("(not set)")),
@@ -803,59 +865,15 @@ function Loomera:isServerReachable()
 end
 
 ------------------------------------------------------------------------------
--- Opportunistic 5-minute periodic auto-sync (re-arming scheduled task)
+-- Sync on sleep / power-off (debounced, opportunistic — never forces Wi-Fi)
 ------------------------------------------------------------------------------
 
--- Build (once) and return the re-arming periodic task closure. The closure
--- captures `self`; we store the SAME ref so UIManager:unschedule can cancel it.
-function Loomera:_getPeriodicTask()
-    if self.periodic_task then return self.periodic_task end
-    self.periodic_task = function()
-        -- Run the body fully guarded so a throw can never kill the scheduler.
-        pcall(function()
-            if self.auto_sync and self:isConfigured() then
-                -- Opportunistic: only sync if reachable WITHOUT forcing Wi-Fi.
-                if self:isServerReachable() then
-                    self:fullSync{ silent = true, force_all = false }
-                else
-                    logger.dbg("Loomera: periodic sync skipped (unreachable)")
-                end
-            end
-        end)
-        -- ALWAYS re-arm for another interval, regardless of what happened above,
-        -- as long as the task hasn't been torn down / toggled off.
-        if self._periodic_armed then
-            UIManager:scheduleIn(self.PERIODIC_INTERVAL, self.periodic_task)
-        end
-    end
-    return self.periodic_task
-end
-
--- Arm the periodic task (idempotent: unschedule any existing copy first).
-function Loomera:_startPeriodic()
-    local task = self:_getPeriodicTask()
-    self._periodic_armed = true
-    pcall(function() UIManager:unschedule(task) end)
-    UIManager:scheduleIn(self.PERIODIC_INTERVAL, task)
-end
-
--- Disarm + unschedule the periodic task.
-function Loomera:_stopPeriodic()
-    self._periodic_armed = false
-    if self.periodic_task then
-        pcall(function() UIManager:unschedule(self.periodic_task) end)
-    end
-end
-
-------------------------------------------------------------------------------
--- Auto-sync hooks (debounced, opportunistic — never forces Wi-Fi)
-------------------------------------------------------------------------------
-
--- Extra opportunistic trigger fired on document close / suspend. Debounced and
--- fully guarded; best-effort incremental fullSync. Does NOT force Wi-Fi — only
--- syncs if the server is already reachable, so it never blocks close/suspend.
+-- Best-effort push fired when a book closes or the device sleeps / powers off.
+-- Debounced and fully guarded; only syncs if the server is ALREADY reachable,
+-- so it never blocks close/suspend or brings up Wi-Fi. (Routine syncing is now
+-- this + the manual "Sync" button — there is no background 5-minute task.)
 function Loomera:_autoSync()
-    if not self.auto_sync or not self:isConfigured() then return end
+    if not self:isConfigured() then return end
     local now = os.time()
     if now - (self._last_autosync or 0) < self.AUTOSYNC_DEBOUNCE then return end
     self._last_autosync = now
@@ -871,14 +889,13 @@ function Loomera:onCloseDocument()
 end
 
 function Loomera:onSuspend()
-    -- Opportunistic best-effort push before sleeping (never forces Wi-Fi).
+    -- Attempt a push before the device sleeps (opportunistic; never forces Wi-Fi).
     self:_autoSync()
 end
 
--- Tidy the scheduled task on plugin teardown so we never leave a dangling
--- re-arming closure behind (e.g. on document/reader-instance teardown).
-function Loomera:onCloseWidget()
-    self:_stopPeriodic()
+function Loomera:onPowerOff()
+    -- And when the device is turned off.
+    self:_autoSync()
 end
 
 return Loomera
